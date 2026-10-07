@@ -1,3 +1,9 @@
+#saved folder name. in medicart_vision.py file. and to run it give input into the terminal - python medicart_vision.py
+
+
+
+
+
 #!/usr/bin/env python3
 
 import json
