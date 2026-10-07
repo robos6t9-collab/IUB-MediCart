@@ -1,7 +1,6 @@
-
 #include <Arduino.h>
 
-// [FIX-2] Optional AVR hardware watchdog. OFF by default, see the notes after the files.
+// [FIX-2] Optional AVR hardware watchdog. OFF by default.
 #define USE_HW_WATCHDOG 0
 #if USE_HW_WATCHDOG && defined(ARDUINO_ARCH_AVR)
 #include <avr/wdt.h>
@@ -23,11 +22,11 @@ const int MOTOR_R_PIN2 = 5;   // Reverse PWM
 // 5-CHANNEL IR SENSOR ARRAY
 // ==========================================
 
-// [0] Far Left
-// [1] Left
-// [2] Center
-// [3] Right
-// [4] Far Right
+// [0] Far Left   = S1
+// [1] Left       = S2
+// [2] Center     = S3
+// [3] Right      = S4
+// [4] Far Right  = S5
 const int IR_PINS[5] = {A8, A9, A10, A11, A12};
 
 // ==========================================
@@ -36,24 +35,10 @@ const int IR_PINS[5] = {A8, A9, A10, A11, A12};
 
 const int BUZZER_PIN = 24;
 
-// 10 available digital output pins that do not conflict with:
-// - motors 2,3,4,5
-// - IR sensors A8-A12
-// - buzzer pin 24
-// - serial pins 0,1
 const int QR_OUTPUT_PINS[10] = {6, 7, 8, 9, 10, 11, 12, 13, 22, 23};
 
-// QR output mapping:
-// QR 1 -> pin 6
-// QR 2 -> pin 7
-// QR 3 -> pin 8
-// QR 4 -> pin 9
-// QR 5 -> pin 10
-// QR 6 -> pin 11
-// QR 7 -> pin 12
-// QR 8 -> pin 13
-// QR 9 -> pin 22
-// QR 10 -> pin 23
+// QR 1 -> pin 6,  QR 2 -> pin 7,  QR 3 -> pin 8,  QR 4 -> pin 9,  QR 5 -> pin 10
+// QR 6 -> pin 11, QR 7 -> pin 12, QR 8 -> pin 13, QR 9 -> pin 22, QR 10 -> pin 23
 
 // ==========================================
 // SETTINGS
@@ -63,20 +48,37 @@ const int QR_OUTPUT_PINS[10] = {6, 7, 8, 9, 10, 11, 12, 13, 22, 23};
 // false = white line on black surface
 const bool BLACK_LINE = true;
 
-// Motor speeds
-const int FORWARD_SPEED = 150;
-const int SLIGHT_SPEED = 120;
-const int STRONG_SPEED = 180;
+// ---- Motor speeds (0-255) used by the line-following table ----
+const int FULL_SPEED          = 180;  // 0 0 1 0 0  perfect center
+const int FORWARD_SPEED       = 150;  // 0 1 1 1 0  wide center, and the "fast" side of every turn
+const int SOFT_INNER_SPEED    = 120;  // inner wheel on a soft turn
+const int MEDIUM_INNER_SPEED  = 60;   // inner wheel on a medium turn
+const int HARD_INNER_SPEED    = 0;    // inner wheel on a hard turn
+const int HARD_OUTER_SPEED    = 180;  // outer wheel on a hard turn
+const int SEARCH_SPEED        = 110;  // pivot speed while searching for a lost line
+
+// ---- Intersection (1 1 1 1 1) ----
+// Stop for INTERSECTION_PAUSE_MS (your "execute preset" goes here), then drive
+// straight across for INTERSECTION_CROSS_MS, then stop until the pattern changes.
+const unsigned long INTERSECTION_PAUSE_MS = 1500;
+const unsigned long INTERSECTION_CROSS_MS = 800;
+
+// ---- Lost line (0 0 0 0 0) ----
+// Pivot toward the side where the line was last seen for up to LOST_SEARCH_MS,
+// then stop. Set LOST_LINE_RECOVERY to false for "just stop immediately".
+const bool LOST_LINE_RECOVERY = true;
+const unsigned long LOST_SEARCH_MS = 1500;
 
 const unsigned long COMMAND_TIMEOUT_MS = 2000;
 const bool DEBUG_IR_SENSORS = false;
 
-// [FIX-5] Debug output for diagnosis. Python prints these as "[ARDUINO] ...".
+// Debug output for diagnosis. Python prints these as "[ARDUINO] ...".
 const bool DEBUG_SAFETY = true;
-// Never print more often than this, so a flickering state can't slow the LFR loop.
+// Prints "DBG sensors=00100" whenever the sensor pattern changes (can be chatty).
+const bool DEBUG_SENSORS = false;
 const unsigned long DEBUG_MIN_INTERVAL_MS = 50;
 
-// [FIX-5] "Line lost" beep pattern: 100 ms ON, 400 ms OFF (safety stop stays a SOLID tone).
+// "Line lost" beep pattern: 100 ms ON, 400 ms OFF (safety stop stays a SOLID tone).
 const unsigned long LINE_LOST_BEEP_PERIOD_MS = 500;
 const unsigned long LINE_LOST_BEEP_ON_MS = 100;
 
@@ -90,13 +92,21 @@ String serialBuffer = "";
 unsigned long lastSafetyHeartbeatMs = 0;
 unsigned long lastIRDebugMs = 0;
 
-// [FIX-5] Set by lineFollowing() when all 5 IR sensors see no line.
+// Set by lineFollowing() when all 5 IR sensors see no line.
 bool lineLost = false;
 unsigned long lastLineLostMs = 0;
 
-// [FIX-5] Debug bookkeeping: what we last printed.
+// ---- Line-following memory ----
+int lastLineSide = 0;                    // -1 = line was last on the left, 0 = center/unknown, +1 = right
+bool intersectionActive = false;         // true while the pattern is 1 1 1 1 1
+unsigned long intersectionStartMs = 0;
+unsigned long lostStartMs = 0;           // when the current lost-line episode began
+uint8_t currentPattern = 0;              // latest sensor pattern, bit 4 = S1 ... bit 0 = S5
+
+// Debug bookkeeping: what we last printed.
 bool prevObstacleDebug = true;
 bool prevLineLostDebug = false;
+uint8_t prevPatternDebug = 0xFF;
 unsigned long lastDebugPrintMs = 0;
 
 // ==========================================
@@ -141,34 +151,10 @@ void rightMotor(int speed)
     }
 }
 
-void forward()
+void drive(int leftSpeed, int rightSpeed)
 {
-    leftMotor(FORWARD_SPEED);
-    rightMotor(FORWARD_SPEED);
-}
-
-void slightRight()
-{
-    leftMotor(SLIGHT_SPEED);
-    rightMotor(FORWARD_SPEED);
-}
-
-void strongRight()
-{
-    leftMotor(STRONG_SPEED);
-    rightMotor(0);
-}
-
-void slightLeft()
-{
-    leftMotor(FORWARD_SPEED);
-    rightMotor(SLIGHT_SPEED);
-}
-
-void strongLeft()
-{
-    leftMotor(0);
-    rightMotor(STRONG_SPEED);
+    leftMotor(leftSpeed);
+    rightMotor(rightSpeed);
 }
 
 void stopMotors()
@@ -177,10 +163,27 @@ void stopMotors()
     rightMotor(0);
 }
 
+// ---- Steering helpers (turning LEFT = slow down the LEFT wheel) ----
+
+void forwardFull()   { drive(FULL_SPEED, FULL_SPEED); }
+void forwardNormal() { drive(FORWARD_SPEED, FORWARD_SPEED); }
+
+void turnLeftSoft()   { drive(SOFT_INNER_SPEED,   FORWARD_SPEED); }
+void turnLeftMedium() { drive(MEDIUM_INNER_SPEED, FORWARD_SPEED); }
+void turnLeftHard()   { drive(HARD_INNER_SPEED,   HARD_OUTER_SPEED); }
+
+void turnRightSoft()   { drive(FORWARD_SPEED, SOFT_INNER_SPEED); }
+void turnRightMedium() { drive(FORWARD_SPEED, MEDIUM_INNER_SPEED); }
+void turnRightHard()   { drive(HARD_OUTER_SPEED, HARD_INNER_SPEED); }
+
+void pivotLeft(int speed)  { drive(-speed, speed); }   // spin in place, counter-clockwise
+void pivotRight(int speed) { drive(speed, -speed); }   // spin in place, clockwise
+
 // ==========================================
 // READ SENSOR
 // ==========================================
 
+// true = this sensor sees the line (the "1" in your table)
 bool sensorActive(int index)
 {
     int value = digitalRead(IR_PINS[index]);
@@ -208,6 +211,31 @@ void readIRSensors(bool &s0, bool &s1, bool &s2, bool &s3, bool &s4)
 // LINE FOLLOWING
 // ==========================================
 
+// Clears the timers/flags so a resume after a safety stop starts fresh.
+void resetLineState()
+{
+    lineLost = false;
+    intersectionActive = false;
+}
+
+// Used ONLY for patterns that are not in your table (for example 1 1 1 0 0 or
+// 0 1 1 0 0). It works out where the line is on average:
+//   S1..S5 count as positions -2, -1, 0, +1, +2
+// and then picks the closest of your table's actions.
+void steerByPosition(bool s0, bool s1, bool s2, bool s3, bool s4)
+{
+    int count = (int)s0 + (int)s1 + (int)s2 + (int)s3 + (int)s4;
+    float position = (-2.0f * s0 - 1.0f * s1 + 1.0f * s3 + 2.0f * s4) / (float)count;
+
+    if (position <= -1.75f)      { turnLeftHard();    lastLineSide = -1; }
+    else if (position <= -1.25f) { turnLeftMedium();  lastLineSide = -1; }
+    else if (position <= -0.5f)  { turnLeftSoft();    lastLineSide = -1; }
+    else if (position < 0.5f)    { forwardNormal();   lastLineSide = 0;  }
+    else if (position < 1.25f)   { turnRightSoft();   lastLineSide = 1;  }
+    else if (position < 1.75f)   { turnRightMedium(); lastLineSide = 1;  }
+    else                         { turnRightHard();   lastLineSide = 1;  }
+}
+
 void lineFollowing()
 {
     if (obstacleDetected)
@@ -229,55 +257,85 @@ void lineFollowing()
         lastIRDebugMs = millis();
     }
 
-    // [FIX-5] Assume the line is found; only the "all sensors inactive" branch below sets it true.
+    unsigned long now = millis();
+    bool wasLost = lineLost;   // remember last pass, then assume "line found" until proven otherwise
     lineLost = false;
 
-    // Existing logic preserved
-    if (!s0 && !s1 && s2 && !s3 && !s4)
+    // Pack the 5 sensors into one number so it reads like your table:
+    // pattern 0b01000 means S1=0 S2=1 S3=0 S4=0 S5=0
+    currentPattern = (uint8_t)((s0 << 4) | (s1 << 3) | (s2 << 2) | (s3 << 1) | (s4 << 0));
+
+    // ---- 1 1 1 1 1 : Intersection / Stop / Execute Preset ----
+    if (currentPattern == 0b11111)
     {
-        forward();
+        if (!intersectionActive)
+        {
+            intersectionActive = true;
+            intersectionStartMs = now;
+        }
+        unsigned long elapsed = now - intersectionStartMs;
+        if (elapsed < INTERSECTION_PAUSE_MS)
+        {
+            stopMotors();           // pause here; put your preset action in this spot
+        }
+        else if (elapsed < INTERSECTION_PAUSE_MS + INTERSECTION_CROSS_MS)
+        {
+            forwardNormal();        // drive straight across the crossing
+        }
+        else
+        {
+            stopMotors();           // still all-black: stop instead of driving blindly
+        }
+        return;
     }
-    else if (!s0 && s1 && s2 && !s3 && !s4)
+    intersectionActive = false;
+
+    // ---- 0 0 0 0 0 : Lost line -> recovery using memory of last position ----
+    if (currentPattern == 0b00000)
     {
-        slightRight();
+        lineLost = true;            // drives the beep + "DBG lineLost" output
+        lastLineLostMs = now;
+        if (!wasLost)
+        {
+            lostStartMs = now;      // a new lost-line episode just began
+        }
+
+        if (LOST_LINE_RECOVERY && lastLineSide != 0 && (now - lostStartMs) < LOST_SEARCH_MS)
+        {
+            if (lastLineSide < 0)
+            {
+                pivotLeft(SEARCH_SPEED);    // line was last on the left: search left
+            }
+            else
+            {
+                pivotRight(SEARCH_SPEED);   // line was last on the right: search right
+            }
+        }
+        else
+        {
+            stopMotors();
+        }
+        return;
     }
-    else if (s0 && s1 && !s2 && !s3 && !s4)
+
+    // ---- The rest of your table ----
+    switch (currentPattern)
     {
-        strongRight();
-    }
-    else if (!s0 && !s1 && s2 && s3 && !s4)
-    {
-        slightLeft();
-    }
-    else if (!s0 && !s1 && !s2 && s3 && s4)
-    {
-        strongLeft();
-    }
-    else if (s0 && s1 && s2 && !s3 && !s4)
-    {
-        strongRight();
-    }
-    else if (!s0 && s1 && s2 && s3 && s4)
-    {
-        strongLeft();
-    }
-    else if (s0 && s1 && s2 && s3 && !s4)
-    {
-        strongRight();
-    }
-    else if (!s0 && !s1 && !s2 && !s3 && !s4)
-    {
-        stopMotors();
-        lineLost = true;               // [FIX-5] remember that this stop is "line lost", not "safety"
-        lastLineLostMs = millis();     // [FIX-5]
-    }
-    else if (s0 && s1 && s2 && s3 && s4)
-    {
-        forward();
-    }
-    else
-    {
-        forward();
+        case 0b00100: forwardFull();   lastLineSide = 0;  break;   // Perfect center
+        case 0b01110: forwardNormal(); lastLineSide = 0;  break;   // Center (wide)
+
+        case 0b01000: turnLeftSoft();    lastLineSide = -1; break; // Slight left
+        case 0b11000: turnLeftMedium();  lastLineSide = -1; break; // Medium left
+        case 0b10000: turnLeftHard();    lastLineSide = -1; break; // Sharp left
+
+        case 0b00010: turnRightSoft();   lastLineSide = 1;  break; // Slight right
+        case 0b00011: turnRightMedium(); lastLineSide = 1;  break; // Medium right
+        case 0b00001: turnRightHard();   lastLineSide = 1;  break; // Sharp right
+
+        default:
+            // A pattern your table doesn't list: steer by where the line is on average.
+            steerByPosition(s0, s1, s2, s3, s4);
+            break;
     }
 }
 
@@ -293,13 +351,12 @@ void buzzerControl()
     {
         obstacleDetected = true;
     }
-    // Safety stop or watchdog timeout: SOLID buzzer (unchanged behaviour).
+    // Safety stop or watchdog timeout: SOLID buzzer.
     bool buzzerOn = obstacleDetected || timedOut;
     digitalWrite(BUZZER_PIN, buzzerOn ? HIGH : LOW);
 }
 
-// [FIX-5] Line lost (and NOT a safety stop): short beep, 100 ms on / 400 ms off.
-// Runs after lineFollowing(), so it overrides the "buzzer off" that buzzerControl() just set.
+// Line lost (and NOT a safety stop): short beep, 100 ms on / 400 ms off.
 void lineLostBeep()
 {
     if (lineLost && !obstacleDetected)
@@ -309,8 +366,7 @@ void lineLostBeep()
     }
 }
 
-// [FIX-5] Print only when something changed, and never faster than DEBUG_MIN_INTERVAL_MS.
-// If a change can't be printed yet, it stays "changed" and is printed on a later pass.
+// Print only when something changed, and never faster than DEBUG_MIN_INTERVAL_MS.
 void debugReport()
 {
     if (!DEBUG_SAFETY)
@@ -340,6 +396,17 @@ void debugReport()
         Serial.print("DBG lineLost=");
         Serial.println((int)lineLost);
         prevLineLostDebug = lineLost;
+        lastDebugPrintMs = now;
+    }
+    else if (DEBUG_SENSORS && currentPattern != prevPatternDebug)
+    {
+        Serial.print("DBG sensors=");
+        for (int bit = 4; bit >= 0; bit--)
+        {
+            Serial.print((currentPattern >> bit) & 1);
+        }
+        Serial.println();
+        prevPatternDebug = currentPattern;
         lastDebugPrintMs = now;
     }
 }
@@ -426,8 +493,8 @@ void processSerialCommands()
 void setup()
 {
 #if USE_HW_WATCHDOG && defined(ARDUINO_ARCH_AVR)
-    MCUSR = 0;          // [FIX-2] clear reset flags
-    wdt_disable();      // [FIX-2] make sure an old watchdog setting can't fire during setup
+    MCUSR = 0;
+    wdt_disable();
 #endif
 
     Serial.begin(115200);
@@ -458,7 +525,7 @@ void setup()
     Serial.println("MediCart ready");
 
 #if USE_HW_WATCHDOG && defined(ARDUINO_ARCH_AVR)
-    wdt_enable(WDTO_2S);   // [FIX-2] if loop() ever hangs, the chip resets and boots with obstacleDetected = true
+    wdt_enable(WDTO_2S);
 #endif
 }
 
@@ -469,7 +536,7 @@ void setup()
 void loop()
 {
 #if USE_HW_WATCHDOG && defined(ARDUINO_ARCH_AVR)
-    wdt_reset();           // [FIX-2] "I'm still alive"
+    wdt_reset();
 #endif
 
     processSerialCommands();
@@ -478,14 +545,14 @@ void loop()
     if (obstacleDetected)
     {
         stopMotors();
-        lineLost = false;  // [FIX-5] a safety stop is not a "line lost" situation
+        resetLineState();   // a safety stop is not "line lost"; also restarts intersection/search timers
     }
     else
     {
         lineFollowing();
     }
 
-    lineLostBeep();        // [FIX-5]
-    debugReport();         // [FIX-5]
+    lineLostBeep();
+    debugReport();
     updateQROutputs();
 }
